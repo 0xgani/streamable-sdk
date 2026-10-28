@@ -15,6 +15,7 @@ dependencies.
 ```bash
 npx streamable-uploader upload ./video.mp4 --label 182334 --title "My video"
 npx streamable-uploader upload https://example.com/video.mp4
+npx streamable-uploader upload "$ZOOM_DOWNLOAD_URL" -H "Authorization: Bearer $ZOOM_DOWNLOAD_TOKEN"
 npx streamable-uploader list --label 182334
 npx streamable-uploader delete abc123 def456
 ```
@@ -45,6 +46,7 @@ The label id is the number in the dashboard URL when you open a label.
 | Option                        | Default    | Description                                     |
 | ----------------------------- | ---------- | ----------------------------------------------- |
 | `--title <title>`             | file name  | Video title                                     |
+| `-H, --header "Name: value"`  |            | HTTP header for downloading a URL source; repeat the flag for more than one |
 | `--no-wait`                   | off        | Return as soon as the upload finishes, without waiting for processing |
 | `--part-size <MiB>`           | 16         | Multipart part size                             |
 | `--concurrency <n>`           | 4          | Parallel part uploads                           |
@@ -84,8 +86,25 @@ It logs in on first use; call `await client.login()` yourself to fail early on b
 | `getVideo(shortcode)` | Public video info, including `status` (1 processing, 2 ready, 3 error) |
 | `waitForReady(shortcode, log?, timeoutMs?)` | Polls until the video is ready (default timeout 15 min) |
 
-`UploadOptions`: `labelId`, `title`, `fileName`, `waitForReady`, `onStatus`, `onProgress`,
+`UploadOptions`: `labelId`, `title`, `fileName`, `headers`, `waitForReady`, `onStatus`, `onProgress`,
 `multipartThreshold`, `partSize`, `concurrency`.
+
+### Authenticated URLs (e.g. Zoom recordings)
+
+Use `headers` (CLI: `-H`) to send a token or cookie when downloading a URL source. For Zoom, pass the
+recording's `download_token` (from the `recording.completed` webhook) or an OAuth access token as a bearer token:
+
+```ts
+await client.upload(recording.download_url, {
+  headers: { Authorization: `Bearer ${downloadToken}` },
+  title: recording.topic,
+});
+```
+
+Your headers are only sent to the URL's own origin. Redirects are followed manually, and the headers are
+dropped when a redirect points to another host, such as the signed CDN/S3 link Zoom redirects to. That keeps the
+token from leaking, and S3 would reject the extra `Authorization` header anyway. Every part re-requests the
+original URL, so a short-lived signed redirect can't expire partway through a long upload.
 
 Errors are thrown as `StreamableError`, with the HTTP `status` and response `body` when there is one.
 

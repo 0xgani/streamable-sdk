@@ -14,6 +14,8 @@ Credentials (flags override env; a .env file in the current directory is loaded)
 
 Upload options:
   --title <title>                Video title (default: file name)
+  -H, --header "Name: value"     HTTP header for downloading a URL source (repeatable),
+                                 e.g. -H "Authorization: Bearer <token>"
   --no-wait                      Don't wait for Streamable to finish processing
   --part-size <MiB>              Multipart part size (default 16)
   --concurrency <n>              Parallel part uploads (default 4)
@@ -47,6 +49,7 @@ async function main() {
       password: { type: "string" },
       label: { type: "string" },
       title: { type: "string" },
+      header: { type: "string", short: "H", multiple: true },
       "no-wait": { type: "boolean" },
       "part-size": { type: "string" },
       concurrency: { type: "string" },
@@ -74,10 +77,16 @@ async function main() {
     case "upload": {
       const [source] = args;
       if (!source) fail("Usage: streamable-uploader upload <file-or-url>");
+      const headers = (values.header ?? []).map((h): [string, string] => {
+        const i = h.indexOf(":");
+        if (i < 1) fail(`Invalid header "${h}", expected "Name: value"`);
+        return [h.slice(0, i).trim(), h.slice(i + 1).trim()];
+      });
       let lastPrinted = -1;
       const result = await client.upload(source, {
         labelId: labelId || undefined,
         title: values.title,
+        headers,
         waitForReady: !values["no-wait"],
         partSize: mib(values["part-size"]),
         multipartThreshold: mib(values["multipart-threshold"]),

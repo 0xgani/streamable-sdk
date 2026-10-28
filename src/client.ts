@@ -43,6 +43,11 @@ export interface UploadOptions {
   title?: string;
   /** File name reported to Streamable. Defaults to the path/URL/File name. */
   fileName?: string;
+  /**
+   * Extra HTTP headers for downloading a URL source, e.g. `{ Authorization: "Bearer <token>" }`.
+   * Only sent to the URL's own origin; never forwarded to a host it redirects to.
+   */
+  headers?: HeadersInit;
   /** Wait until Streamable finishes processing the video. */
   waitForReady?: boolean;
   onStatus?: (message: string) => void;
@@ -150,7 +155,7 @@ export class StreamableClient {
       const name = opts.fileName ?? ("name" in source && typeof source.name === "string" ? source.name : "video.mp4");
       input = { file: source, name, size: source.size };
     } else if (isUrl(source)) {
-      input = await this.openUrl(new URL(source), log);
+      input = await this.openUrl(new URL(source), new Headers(opts.headers), log);
     } else {
       input = await this.openFile(String(source));
     }
@@ -206,24 +211,24 @@ export class StreamableClient {
     return { file, name: basename(filePath), size: file.size };
   }
 
-  private async openUrl(url: URL, log: (m: string) => void): Promise<OpenedSource> {
+  private async openUrl(url: URL, headers: Headers, log: (m: string) => void): Promise<OpenedSource> {
     // Probe with a 1-byte range: a 206 with a total size means parts can be fetched on demand.
-    const res = await fetch(url, { headers: { range: "bytes=0-0", "accept-encoding": "identity" } });
+    const res = await fetchSource(url, headers, { range: "bytes=0-0" });
     if (!res.ok || !res.body) throw new StreamableError(`Download failed (${res.status}): ${url}`, res.status);
 
     const name = fileNameFromResponse(res, url);
     const total = Number(res.headers.get("content-range")?.match(/\/(\d+)$/)?.[1]);
     if (res.status === 206 && Number.isFinite(total)) {
       await res.body.cancel();
-      // Reuse the post-redirect URL, and pin the exact version so a change mid-upload is caught.
-      const finalUrl = res.url || url.href;
+      // Pin the exact version so a change mid-upload is caught. Each part re-requests the
+      // original URL, so short-lived signed redirect targets can't expire mid-upload.
       const etag = res.headers.get("etag");
       const validator = (etag && !etag.startsWith("W/") ? etag : null) ?? res.headers.get("last-modified");
       log(`Streaming ${url} via range requests (${(total / 1024 / 1024).toFixed(1)} MB)`);
       return {
         name,
         size: total,
-        ranged: { size: total, read: (start, end) => readRange(finalUrl, start, end, validator) },
+        ranged: { size: total, read: (start, end) => readRange(url, headers, start, end, validator) },
       };
     }
 
@@ -356,10 +361,36 @@ function isUrl(source: string | URL): boolean {
   return source instanceof URL || /^https?:\/\//i.test(source);
 }
 
-async function readRange(url: string, start: number, end: number, validator: string | null): Promise<Blob> {
-  const headers: Record<string, string> = { range: `bytes=${start}-${end - 1}`, "accept-encoding": "identity" };
-  if (validator) headers["if-range"] = validator;
-  const res = await fetch(url, { headers });
+/**
+ * GET a URL source, following redirects manually so the caller's headers (e.g. an auth token)
+ * only go to the original origin. Signed CDN/S3 redirect targets would reject or leak them.
+ */
+async function fetchSource(url: URL, extra: Headers, base: Record<string, string>): Promise<Response> {
+  let current = url;
+  for (let hops = 0; hops <= 10; hops++) {
+    const headers = new Headers(current.origin === url.origin ? extra : undefined);
+    // Ask for the raw bytes so Content-Length / Content-Range match what we read.
+    headers.set("accept-encoding", "identity");
+    for (const [k, v] of Object.entries(base)) headers.set(k, v);
+    const res = await fetch(current, { headers, redirect: "manual" });
+    const location = res.headers.get("location");
+    if (res.status < 300 || res.status >= 400 || !location) return res;
+    await res.body?.cancel();
+    current = new URL(location, current);
+  }
+  throw new StreamableError(`Too many redirects: ${url}`);
+}
+
+async function readRange(
+  url: URL,
+  extra: Headers,
+  start: number,
+  end: number,
+  validator: string | null,
+): Promise<Blob> {
+  const base: Record<string, string> = { range: `bytes=${start}-${end - 1}` };
+  if (validator) base["if-range"] = validator;
+  const res = await fetchSource(url, extra, base);
   if (res.status !== 206) {
     await res.body?.cancel();
     throw new StreamableError(
