@@ -1,6 +1,6 @@
 {
   "name": "streamable-uploader",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Upload videos (local files or URLs, any size) to Streamable with your account, over plain HTTP. CLI + typed SDK for Node.js and Bun.",
   "keywords": [
     "streamable",
