@@ -1,0 +1,43 @@
+{
+  "name": "streamable-uploader",
+  "version": "0.1.0",
+  "description": "Upload videos (local files or URLs, any size) to Streamable with your account, over plain HTTP. CLI + typed SDK for Node.js and Bun.",
+  "keywords": ["streamable", "video", "upload", "uploader", "cli", "sdk", "s3", "multipart"],
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "streamable-uploader": "./dist/cli.js"
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "dev": "bun src/cli.ts",
+    "prepublishOnly": "bun run typecheck && bun run build"
+  },
+  "devDependencies": {
+    "@types/node": "20",
+    "tsup": "^9.0.0",
+    "typescript": "5"
+  }
+}
