@@ -2,8 +2,25 @@
   "name": "streamable-uploader",
   "version": "0.1.0",
   "description": "Upload videos (local files or URLs, any size) to Streamable with your account, over plain HTTP. CLI + typed SDK for Node.js and Bun.",
-  "keywords": ["streamable", "video", "upload", "uploader", "cli", "sdk", "s3", "multipart"],
+  "keywords": [
+    "streamable",
+    "video",
+    "upload",
+    "uploader",
+    "cli",
+    "sdk",
+    "s3",
+    "multipart"
+  ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0xgani/streamable-uploader.git"
+  },
+  "homepage": "https://github.com/0xgani/streamable-uploader#readme",
+  "bugs": {
+    "url": "https://github.com/0xgani/streamable-uploader/issues"
+  },
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -22,9 +39,11 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "streamable-uploader": "./dist/cli.js"
+    "streamable-uploader": "dist/cli.js"
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "engines": {
     "node": ">=20"
   },

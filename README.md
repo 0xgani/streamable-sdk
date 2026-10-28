@@ -150,3 +150,19 @@ bun run dev upload ./video.mp4   # run the CLI from source
 bun run typecheck
 bun run build                    # dist/: ESM, CJS, .d.ts, and the CLI
 ```
+
+## Releasing
+
+npm releases are published by GitHub Actions ([`.github/workflows/publish.yml`](.github/workflows/publish.yml))
+using npm [trusted publishing](https://docs.npmjs.com/trusted-publishers), so no npm token or 2FA code is
+needed. Each release also gets a provenance attestation.
+
+```bash
+npm version patch            # bumps package.json, commits, and tags vX.Y.Z
+git push --follow-tags       # the tag push triggers the publish workflow
+```
+
+The workflow fails if the tag doesn't match the `version` in `package.json`.
+
+One-time setup on npmjs.com: open the package's **Settings → Trusted publishing**, choose GitHub Actions, and
+enter owner `0xgani`, repository `streamable-uploader`, workflow `publish.yml`.
