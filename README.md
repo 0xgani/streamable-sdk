@@ -1,6 +1,6 @@
-# streamable-uploader
+# streamable-sdk
 
-Upload videos to [Streamable](https://streamable.com) with your own account: local files or URLs, any size,
+Upload and download [Streamable](https://streamable.com) videos. Uploads use your own account: local files or URLs, any size,
 straight into a label (folder). It uses plain HTTP requests (no headless browser) and has no runtime
 dependencies.
 
@@ -13,24 +13,25 @@ dependencies.
 ## CLI
 
 ```bash
-npx streamable-uploader upload ./video.mp4 --label 182334 --title "My video"
-npx streamable-uploader upload https://example.com/video.mp4
-npx streamable-uploader upload "$ZOOM_DOWNLOAD_URL" -H "Authorization: Bearer $ZOOM_DOWNLOAD_TOKEN"
-npx streamable-uploader list --label 182334
-npx streamable-uploader delete abc123 def456
+npx streamable-sdk upload ./video.mp4 --label 182334 --title "My video"
+npx streamable-sdk upload https://example.com/video.mp4
+npx streamable-sdk upload "$ZOOM_DOWNLOAD_URL" -H "Authorization: Bearer $ZOOM_DOWNLOAD_TOKEN"
+npx streamable-sdk list --label 182334
+npx streamable-sdk delete abc123 def456
+npx streamable-sdk download https://streamable.com/abc123 -o ./videos/
 ```
 
 The video URL is the only thing printed to stdout, so it's easy to use in scripts:
 
 ```bash
-url=$(npx streamable-uploader upload ./clip.mp4 --no-wait)
+url=$(npx streamable-sdk upload ./clip.mp4 --no-wait)
 ```
 
 Progress and status go to stderr.
 
 ### Credentials
 
-Pass them as flags or environment variables. A `.env` file in the current directory is loaded automatically
+`download` works for any public video and needs no credentials. Everything else does. Pass them as flags or environment variables. A `.env` file in the current directory is loaded automatically
 (see [`.env.example`](.env.example)). Flags take precedence over the environment.
 
 | Flag         | Environment variable                    |
@@ -52,14 +53,21 @@ The label id is the number in the dashboard URL when you open a label.
 | `--concurrency <n>`           | 4          | Parallel part uploads                           |
 | `--multipart-threshold <MiB>` | 32         | Local files at or above this size use multipart |
 
+### Download options
+
+| Option                       | Default            | Description                                |
+| ---------------------------- | ------------------ | ------------------------------------------ |
+| `-o, --output <file-or-dir>` | `<shortcode>.mp4`  | Where to save; a directory keeps the default file name |
+| `--format <name>`            | `mp4`              | Rendition, e.g. `mp4-mobile` when the video has one |
+
 ## SDK
 
 ```bash
-npm install streamable-uploader
+npm install streamable-sdk
 ```
 
 ```ts
-import { StreamableClient } from "streamable-uploader";
+import { StreamableClient } from "streamable-sdk";
 
 const client = new StreamableClient(process.env.STREAMABLE_EMAIL!, process.env.STREAMABLE_PASSWORD!);
 
@@ -84,6 +92,7 @@ It logs in on first use; call `await client.login()` yourself to fail early on b
 | `listVideos({ labelId?, search?, count?, page? })` | Returns `{ total, videos }` for the account, optionally filtered by label |
 | `deleteVideo(shortcode)` | Permanently deletes a video |
 | `getVideo(shortcode)` | Public video info, including `status` (1 processing, 2 ready, 3 error) |
+| `download(shortcodeOrUrl, dest?, { format?, onProgress? })` | Saves a public video's MP4 and returns `{ path, size }`; no login needed |
 | `waitForReady(shortcode, log?, timeoutMs?)` | Polls until the video is ready (default timeout 15 min) |
 
 `UploadOptions`: `labelId`, `title`, `fileName`, `headers`, `waitForReady`, `onStatus`, `onProgress`,
@@ -163,6 +172,3 @@ git push --follow-tags       # the tag push triggers the publish workflow
 ```
 
 The workflow fails if the tag doesn't match the `version` in `package.json`.
-
-One-time setup on npmjs.com: open the package's **Settings → Trusted publishing**, choose GitHub Actions, and
-enter owner `0xgani`, repository `streamable-uploader`, workflow `publish.yml`.

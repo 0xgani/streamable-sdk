@@ -1,6 +1,6 @@
-# streamable-uploader
+# streamable-sdk
 
-Unofficial Streamable uploader published as an npm package: a CLI (`npx streamable-uploader`) and a typed SDK.
+Unofficial Streamable SDK published as an npm package: a CLI (`npx streamable-sdk`) and a typed SDK.
 
 ## Runtime compatibility
 

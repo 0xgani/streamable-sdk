@@ -78,6 +78,18 @@ export interface Video {
   [key: string]: unknown;
 }
 
+export interface DownloadOptions {
+  /** Which rendition to download: `"mp4"` (default), `"mp4-mobile"`, or another key of the video's `files`. */
+  format?: string;
+  /** Called as bytes are written. `total` is 0 when the size is unknown. */
+  onProgress?: (loaded: number, total: number) => void;
+}
+
+export interface DownloadResult {
+  path: string;
+  size: number;
+}
+
 export interface ListVideosOptions {
   labelId?: string | number;
   search?: string;
@@ -189,6 +201,54 @@ export class StreamableClient {
     const res = await fetch(`${PUBLIC_API_HOST}/videos/${encodeURIComponent(shortcode)}`);
     if (!res.ok) throw new StreamableError(`Video lookup failed (${res.status})`, res.status);
     return (await res.json()) as Record<string, any>;
+  }
+
+  /**
+   * Download a video's transcoded file to `dest` (a file path or an existing directory; default
+   * `<shortcode>.mp4` in the current directory). Accepts a shortcode or a streamable.com URL.
+   * Works for any public video, so it doesn't log in.
+   */
+  async download(video: string, dest?: string, opts: DownloadOptions = {}): Promise<DownloadResult> {
+    const shortcode = parseShortcode(video);
+    const format = opts.format ?? "mp4";
+    const info = await this.getVideo(shortcode);
+    if (info.status !== 2) throw new StreamableError(`${shortcode} isn't ready yet (status ${info.status})`);
+    const file = info.files?.[format];
+    if (!file?.url) {
+      const files: Record<string, { url?: string }> = info.files ?? {};
+      const available = Object.keys(files).filter((k) => files[k]?.url).join(", ") || "none";
+      throw new StreamableError(`${shortcode} has no "${format}" file (available: ${available})`);
+    }
+
+    let path = dest ?? `${shortcode}.mp4`;
+    if (dest && (await stat(dest).catch(() => null))?.isDirectory()) path = join(dest, `${shortcode}.mp4`);
+
+    // File URLs come protocol-relative ("//cdn...") or mangled ("https:https://cdn..."), so keep
+    // everything from the first "//".
+    const fileUrl = String(file.url);
+    const res = await fetch(`https:${fileUrl.slice(fileUrl.indexOf("//"))}`);
+    if (!res.ok || !res.body) throw new StreamableError(`Download failed (${res.status})`, res.status);
+    const total = Number(res.headers.get("content-length")) || 0;
+
+    // Manual copy: Bun.write(path, response) hangs on chunked responses.
+    let loaded = 0;
+    const fh = await open(path, "w");
+    try {
+      const reader = res.body.getReader();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        await fh.write(value);
+        loaded += value.byteLength;
+        opts.onProgress?.(loaded, total);
+      }
+    } catch (err) {
+      await fh.close();
+      await unlink(path).catch(() => {});
+      throw err;
+    }
+    await fh.close();
+    return { path, size: loaded };
   }
 
   async waitForReady(shortcode: string, log: (m: string) => void = () => {}, timeoutMs = 15 * 60_000) {
@@ -355,6 +415,14 @@ export class StreamableClient {
     }
     return res;
   }
+}
+
+/** Accepts `abc123`, `https://streamable.com/abc123` or `https://streamable.com/e/abc123`. */
+function parseShortcode(video: string): string {
+  if (!isUrl(video)) return video;
+  const shortcode = new URL(video).pathname.split("/").filter(Boolean).pop();
+  if (!shortcode) throw new StreamableError(`No shortcode in ${video}`);
+  return shortcode;
 }
 
 function isUrl(source: string | URL): boolean {

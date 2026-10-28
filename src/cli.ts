@@ -3,11 +3,12 @@ import { parseArgs } from "node:util";
 import { StreamableClient } from "./client.js";
 
 const HELP = `Usage:
-  streamable-uploader upload <file-or-url> [--title <title>] [--label <id>] [--no-wait]
-  streamable-uploader list [--label <id>]
-  streamable-uploader delete <shortcode>...
+  streamable-sdk upload <file-or-url> [--title <title>] [--label <id>] [--no-wait]
+  streamable-sdk list [--label <id>]
+  streamable-sdk delete <shortcode>...
+  streamable-sdk download <shortcode-or-url>... [-o <file-or-dir>] [--format <name>]
 
-Credentials (flags override env; a .env file in the current directory is loaded):
+Credentials (not needed for download; flags override env; a .env file in the current directory is loaded):
   --email     or STREAMABLE_EMAIL / EMAIL
   --password  or STREAMABLE_PASSWORD / PASSWORD
   --label     or STREAMABLE_LABEL_ID / LABEL_ID
@@ -20,7 +21,11 @@ Upload options:
   --part-size <MiB>              Multipart part size (default 16)
   --concurrency <n>              Parallel part uploads (default 4)
   --multipart-threshold <MiB>    Local files at/above this use multipart (default 32)
-  -h, --help                     Show this help`;
+  -h, --help                     Show this help
+
+Download options:
+  -o, --output <file-or-dir>     Where to save (default: <shortcode>.mp4)
+  --format <name>                Rendition: mp4 (default) or mp4-mobile, when available`;
 
 /** Minimal .env loader (KEY=value, optional quotes); never overrides existing env vars. */
 function loadDotEnv(path = ".env") {
@@ -54,6 +59,8 @@ async function main() {
       "part-size": { type: "string" },
       concurrency: { type: "string" },
       "multipart-threshold": { type: "string" },
+      output: { type: "string", short: "o" },
+      format: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -62,6 +69,8 @@ async function main() {
     console.log(HELP);
     return;
   }
+
+  if (command === "download") return download(args, values.output, values.format);
 
   loadDotEnv();
   const env = process.env;
@@ -76,7 +85,7 @@ async function main() {
   switch (command) {
     case "upload": {
       const [source] = args;
-      if (!source) fail("Usage: streamable-uploader upload <file-or-url>");
+      if (!source) fail("Usage: streamable-sdk upload <file-or-url>");
       const headers = (values.header ?? []).map((h): [string, string] => {
         const i = h.indexOf(":");
         if (i < 1) fail(`Invalid header "${h}", expected "Name: value"`);
@@ -116,7 +125,7 @@ async function main() {
       break;
     }
     case "delete": {
-      if (!args.length) fail("Usage: streamable-uploader delete <shortcode>...");
+      if (!args.length) fail("Usage: streamable-sdk delete <shortcode>...");
       for (const shortcode of args) {
         try {
           await client.deleteVideo(shortcode);
@@ -130,6 +139,30 @@ async function main() {
     }
     default:
       fail(`Unknown command "${command}"\n\n${HELP}`);
+  }
+}
+
+async function download(videos: string[], output: string | undefined, format: string | undefined) {
+  if (!videos.length) fail("Usage: streamable-sdk download <shortcode-or-url>...");
+  // Public downloads need no account.
+  const client = new StreamableClient("", "");
+  const isTTY = process.stderr.isTTY;
+  for (const video of videos) {
+    try {
+      const { path } = await client.download(video, output, {
+        format,
+        onProgress: (loaded, total) => {
+          if (!isTTY) return;
+          const pct = total ? ` ${Math.floor((loaded / total) * 100)}%` : "";
+          process.stderr.write(`\r ${pct} (${(loaded / 1024 / 1024).toFixed(1)} MB)`);
+        },
+      });
+      if (isTTY) process.stderr.write("\n");
+      console.log(path);
+    } catch (err) {
+      process.exitCode = 1;
+      console.error(`failed ${video}: ${(err as Error).message}`);
+    }
   }
 }
 

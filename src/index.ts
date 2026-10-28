@@ -1,6 +1,8 @@
 export {
   StreamableClient,
   StreamableError,
+  type DownloadOptions,
+  type DownloadResult,
   type ListVideosOptions,
   type UploadOptions,
   type UploadResult,
