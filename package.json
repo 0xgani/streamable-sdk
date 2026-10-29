@@ -1,6 +1,6 @@
 {
   "name": "streamable-sdk",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Upload and download Streamable videos (uploads: local files or URLs, any size) with your account, over plain HTTP. CLI + typed SDK for Node.js and Bun.",
   "keywords": [
     "streamable",
