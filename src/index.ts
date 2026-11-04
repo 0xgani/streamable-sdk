@@ -1,6 +1,9 @@
 export {
   StreamableClient,
   StreamableError,
+  ProcessingTimeoutError,
+  ProcessingError,
+  type WaitForReadyOptions,
   type DownloadOptions,
   type DownloadResult,
   type ListVideosOptions,

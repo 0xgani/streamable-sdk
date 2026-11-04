@@ -50,6 +50,7 @@
   },
   "sideEffects": false,
   "scripts": {
+    "test": "bun run build && node --test tests/*.test.mjs",
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "dev": "bun src/cli.ts",
