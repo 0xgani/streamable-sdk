@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
-import { StreamableClient } from "./client.js";
+import { ProcessingTimeoutError, StreamableClient } from "./client.js";
 
 const HELP = `Usage:
   streamable-sdk upload <file-or-url> [--title <title>] [--label <id>] [--no-wait]
@@ -18,6 +18,7 @@ Upload options:
   -H, --header "Name: value"     HTTP header for downloading a URL source (repeatable),
                                  e.g. -H "Authorization: Bearer <token>"
   --no-wait                      Don't wait for Streamable to finish processing
+  --processing-timeout <seconds> Processing wait limit (default 900; 0 disables the deadline)
   --part-size <MiB>              Multipart part size (default 16)
   --concurrency <n>              Parallel part uploads (default 4)
   --multipart-threshold <MiB>    Local files at/above this use multipart (default 32)
@@ -56,6 +57,7 @@ async function main() {
       title: { type: "string" },
       header: { type: "string", short: "H", multiple: true },
       "no-wait": { type: "boolean" },
+      "processing-timeout": { type: "string" },
       "part-size": { type: "string" },
       concurrency: { type: "string" },
       "multipart-threshold": { type: "string" },
@@ -86,6 +88,11 @@ async function main() {
     case "upload": {
       const [source] = args;
       if (!source) fail("Usage: streamable-sdk upload <file-or-url>");
+      const rawTimeout = values["processing-timeout"];
+      const seconds = rawTimeout === undefined ? undefined : Number(rawTimeout);
+      if (seconds !== undefined && (!rawTimeout?.trim() || !Number.isFinite(seconds) || seconds < 0 || seconds * 1000 > 2_147_483_647)) {
+        fail("--processing-timeout must be a finite nonnegative number of seconds (maximum 2147483.647)");
+      }
       const headers = (values.header ?? []).map((h): [string, string] => {
         const i = h.indexOf(":");
         if (i < 1) fail(`Invalid header "${h}", expected "Name: value"`);
@@ -97,6 +104,7 @@ async function main() {
         title: values.title,
         headers,
         waitForReady: !values["no-wait"],
+        processing: { timeoutMs: seconds === 0 ? null : seconds === undefined ? undefined : seconds * 1000 },
         partSize: mib(values["part-size"]),
         multipartThreshold: mib(values["multipart-threshold"]),
         concurrency: values.concurrency ? Number(values.concurrency) : undefined,
@@ -170,4 +178,9 @@ function statusName(status: number) {
   return ["uploading", "processing", "ready", "error"][status] ?? String(status);
 }
 
-main().catch((err) => fail(err instanceof Error ? err.message : String(err)));
+main().catch((err) => {
+  if (err instanceof ProcessingTimeoutError) {
+    console.error(`Upload succeeded: ${err.url}. Processing is unconfirmed; resume checking this video instead of uploading again.`);
+  }
+  fail(err instanceof Error ? err.message : String(err));
+});

@@ -50,6 +50,8 @@ export interface UploadOptions {
   headers?: HeadersInit;
   /** Wait until Streamable finishes processing the video. */
   waitForReady?: boolean;
+  /** Processing wait settings, used only when waitForReady is true. */
+  processing?: WaitForReadyOptions;
   onStatus?: (message: string) => void;
   /** Called as bytes reach S3. */
   onProgress?: (loaded: number, total: number) => void;
@@ -59,6 +61,15 @@ export interface UploadOptions {
   partSize?: number;
   /** Parallel part uploads. Default 4. */
   concurrency?: number;
+}
+
+export interface WaitForReadyOptions {
+  /** Maximum processing wait in ms. Default 15 minutes; null disables the deadline. */
+  timeoutMs?: number | null;
+  /** Cancels the local wait, including an in-flight status request; does not delete the video. */
+  signal?: AbortSignal;
+  /** Delay between status checks in ms. Default 3000. */
+  pollIntervalMs?: number;
 }
 
 export interface UploadResult {
@@ -129,6 +140,39 @@ export class StreamableError extends Error {
   }
 }
 
+/** The wait ended without confirmation; the remote video may still become ready. */
+export class ProcessingTimeoutError extends StreamableError {
+  readonly url: string;
+  constructor(readonly shortcode: string, readonly lastStatus: number | null) {
+    super(`Timed out waiting for ${shortcode} to process; resume checking this video instead of uploading again`);
+    this.name = "ProcessingTimeoutError";
+    this.url = `https://streamable.com/${shortcode}`;
+  }
+}
+
+/** Streamable explicitly reported status 3. */
+export class ProcessingError extends StreamableError {
+  readonly url: string;
+  constructor(readonly shortcode: string, message: string) {
+    super(`Processing failed: ${message}`);
+    this.name = "ProcessingError";
+    this.url = `https://streamable.com/${shortcode}`;
+  }
+}
+
+function processingOptions(options: number | null | WaitForReadyOptions) {
+  const opts = typeof options === "object" && options !== null ? options : { timeoutMs: options };
+  const timeoutMs = opts.timeoutMs === undefined ? 15 * 60_000 : opts.timeoutMs;
+  const pollIntervalMs = opts.pollIntervalMs ?? 3000;
+  if (timeoutMs !== null && (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 2_147_483_647)) {
+    throw new RangeError("timeoutMs must be null or a finite number between 0 and 2147483647");
+  }
+  if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0 || pollIntervalMs > 2_147_483_647) {
+    throw new RangeError("pollIntervalMs must be a finite number greater than 0 and at most 2147483647");
+  }
+  return { timeoutMs, pollIntervalMs, signal: opts.signal };
+}
+
 export class StreamableClient {
   private cookies = new Map<string, string>();
   /** Account info returned by login(). */
@@ -159,6 +203,11 @@ export class StreamableClient {
    * buffer the whole response regardless of how fast it is read.)
    */
   async upload(source: string | URL | Blob, opts: UploadOptions = {}): Promise<UploadResult> {
+    // Reject invalid wait settings before creating a remote upload.
+    if (opts.waitForReady) {
+      processingOptions(opts.processing ?? {});
+      opts.processing?.signal?.throwIfAborted();
+    }
     const log = opts.onStatus ?? (() => {});
     if (!this.user) await this.login();
 
@@ -197,8 +246,8 @@ export class StreamableClient {
   }
 
   /** Public video info. */
-  async getVideo(shortcode: string): Promise<Record<string, any>> {
-    const res = await fetch(`${PUBLIC_API_HOST}/videos/${encodeURIComponent(shortcode)}`);
+  async getVideo(shortcode: string, opts: { signal?: AbortSignal } = {}): Promise<Record<string, any>> {
+    const res = await fetch(`${PUBLIC_API_HOST}/videos/${encodeURIComponent(shortcode)}`, { signal: opts.signal });
     if (!res.ok) throw new StreamableError(`Video lookup failed (${res.status})`, res.status);
     return (await res.json()) as Record<string, any>;
   }
@@ -251,16 +300,38 @@ export class StreamableClient {
     return { path, size: loaded };
   }
 
-  async waitForReady(shortcode: string, log: (m: string) => void = () => {}, timeoutMs = 15 * 60_000) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const video = await this.getVideo(shortcode).catch(() => null);
-      if (video?.status === 2) return video;
-      if (video?.status === 3) throw new StreamableError(`Processing failed: ${video.message ?? "unknown"}`);
-      log(`Processing… ${video?.percent ?? 0}%`);
-      await sleep(3000);
+  async waitForReady(shortcode: string, log: (m: string) => void = () => {}, options: number | null | WaitForReadyOptions = {}) {
+    const { timeoutMs, pollIntervalMs, signal } = processingOptions(options);
+    signal?.throwIfAborted();
+    let lastStatus: number | null = null;
+    if (timeoutMs === 0) throw new ProcessingTimeoutError(shortcode, lastStatus);
+    const controller = new AbortController();
+    const cancel = () => controller.abort(signal!.reason);
+    signal?.addEventListener("abort", cancel, { once: true });
+    const timer = timeoutMs === null ? undefined : setTimeout(() => {
+      controller.abort(new ProcessingTimeoutError(shortcode, lastStatus));
+    }, timeoutMs);
+    try {
+      for (;;) {
+        controller.signal.throwIfAborted();
+        const video = await this.getVideo(shortcode, { signal: controller.signal }).catch(() => {
+          controller.signal.throwIfAborted();
+          return null;
+        });
+        controller.signal.throwIfAborted();
+        if (typeof video?.status === "number") lastStatus = video.status;
+        if (video?.status === 2) return video;
+        if (video?.status === 3) throw new ProcessingError(shortcode, String(video.message ?? "unknown"));
+        log(video ? `Processing… ${video.percent ?? 0}%` : "Processing status unavailable; retrying");
+        await sleep(pollIntervalMs, undefined, { signal: controller.signal });
+      }
+    } catch (error) {
+      if (controller.signal.aborted) throw controller.signal.reason;
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", cancel);
     }
-    throw new StreamableError(`Timed out waiting for ${shortcode} to process`);
   }
 
   private async openFile(filePath: string): Promise<OpenedSource> {
@@ -375,7 +446,7 @@ export class StreamableClient {
     });
 
     const result = { shortcode, url: `https://streamable.com/${shortcode}` };
-    if (opts.waitForReady) await this.waitForReady(shortcode, log);
+    if (opts.waitForReady) await this.waitForReady(shortcode, log, opts.processing);
     return result;
   }
 

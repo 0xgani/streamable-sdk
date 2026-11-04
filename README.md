@@ -49,6 +49,7 @@ The label id is the number in the dashboard URL when you open a label.
 | `--title <title>`             | file name  | Video title                                     |
 | `-H, --header "Name: value"`  |            | HTTP header for downloading a URL source; repeat the flag for more than one |
 | `--no-wait`                   | off        | Return as soon as the upload finishes, without waiting for processing |
+| `--processing-timeout <seconds>` | 900     | Processing wait deadline; `0` waits without a deadline. Ignored with `--no-wait` |
 | `--part-size <MiB>`           | 16         | Multipart part size                             |
 | `--concurrency <n>`           | 4          | Parallel part uploads                           |
 | `--multipart-threshold <MiB>` | 32         | Local files at or above this size use multipart |
@@ -91,12 +92,94 @@ It logs in on first use; call `await client.login()` yourself to fail early on b
 | `upload(source, options?)` | Uploads a file and returns `{ shortcode, url }` |
 | `listVideos({ labelId?, search?, count?, page? })` | Returns `{ total, videos }` for the account, optionally filtered by label |
 | `deleteVideo(shortcode)` | Permanently deletes a video |
-| `getVideo(shortcode)` | Public video info, including `status` (1 processing, 2 ready, 3 error) |
+| `getVideo(shortcode, { signal? }?)` | Public video info, including `status` (1 processing, 2 ready, 3 error); supports cancelling the request |
 | `download(shortcodeOrUrl, dest?, { format?, onProgress? })` | Saves a public video's MP4 and returns `{ path, size }`; no login needed |
-| `waitForReady(shortcode, log?, timeoutMs?)` | Polls until the video is ready (default timeout 15 min) |
+| `waitForReady(shortcode, log?, timeoutMsOrOptions?)` | Polls until ready; accepts the legacy timeout in milliseconds or `{ timeoutMs, signal, pollIntervalMs }`. Default timeout 15 minutes; `null` disables it |
 
-`UploadOptions`: `labelId`, `title`, `fileName`, `headers`, `waitForReady`, `onStatus`, `onProgress`,
+`UploadOptions`: `labelId`, `title`, `fileName`, `headers`, `waitForReady`, `processing`, `onStatus`, `onProgress`,
 `multipartThreshold`, `partSize`, `concurrency`.
+
+### Long processing jobs and resumable checks
+
+Upload completion and video readiness are separate events. A long video can finish uploading and
+still need more than 15 minutes to process. A processing timeout means readiness was not confirmed;
+it does **not** mean the upload failed, and must not trigger a new upload.
+
+Existing behavior is preserved: `waitForReady()` defaults to 15 minutes, and numeric third arguments
+are milliseconds. To wait without a deadline, pass `null`, or use the options object:
+
+```ts
+const controller = new AbortController();
+await client.waitForReady(shortcode, console.error, {
+  timeoutMs: null, // no overall deadline
+  signal: controller.signal,
+  pollIntervalMs: 3000,
+});
+// Call controller.abort() from your shutdown/cancel handler to stop waiting.
+```
+
+The same settings are available when uploading:
+
+```ts
+await client.upload("./long-recording.mp4", {
+  waitForReady: true,
+  processing: { timeoutMs: null, signal: controller.signal },
+});
+```
+
+`processing` applies only when `waitForReady: true`. Its signal cancels the processing wait, not the
+preceding upload. Cancellation never deletes the remote video. A finite deadline covers status
+requests (including response bodies) and polling delays; it aborts an in-flight status request.
+`timeoutMs: 0` expires immediately; use `null` to disable the deadline. Timeouts must be finite
+nonnegative milliseconds up to 2147483647, or `null`. Poll intervals must be positive finite
+milliseconds up to the same maximum. Invalid settings are rejected before upload starts.
+
+For persistent services, prefer saving the upload result before checking readiness:
+
+```ts
+const uploaded = await client.upload("./long-recording.mp4", { waitForReady: false });
+// Persist uploaded.shortcode and uploaded.url in your application's database here.
+// On restart, read that record and resume checks; do not call upload() again.
+try {
+  await client.waitForReady(uploaded.shortcode, console.error, { timeoutMs: 60 * 60_000 });
+} catch (error) {
+  if (error instanceof ProcessingTimeoutError) {
+    // Keep the saved job pending and schedule another check of error.shortcode.
+  } else {
+    throw error;
+  }
+}
+```
+
+Import `ProcessingTimeoutError` and `ProcessingError` from `streamable-sdk`. Both extend
+`StreamableError` and contain `shortcode` and `url`. `ProcessingTimeoutError` also contains
+`lastStatus` (the last observed numeric status, or `null` if none was obtained).
+`ProcessingError` means Streamable explicitly returned status `3`. Temporary lookup failures are
+retried and reported as unavailable, rather than as 0% processing. Aborting the wait throws the
+caller's abort reason. Unknown statuses keep waiting. You can also schedule individual
+`getVideo(shortcode, { signal })` checks yourself: status `2` is ready, status `3` is a failure,
+and a failed lookup leaves readiness unknown.
+
+CLI equivalents (seconds, unlike the SDK's milliseconds):
+
+```sh
+streamable-sdk upload ./long-recording.mp4 --processing-timeout 3600
+streamable-sdk upload ./long-recording.mp4 --processing-timeout 0
+streamable-sdk upload ./long-recording.mp4 --no-wait
+```
+
+The CLI still exits nonzero on timeout, but prints the saved URL and explains that the upload
+succeeded and processing remains unconfirmed. `--no-wait` returns the URL immediately after upload
+and ignores the processing deadline. Unlimited waits can continue indefinitely if a video never
+becomes ready; use cancellation or durable scheduled checks when appropriate.
+
+### Development and validation
+
+Run `bun install --frozen-lockfile`, `bun run typecheck`, and `bun run test`. Tests build the package
+and use Node's test runner with mocked HTTP requests, without accessing a real Streamable account.
+They cover timeout recovery, unlimited/cancellable waits, hung lookups, explicit processing failure,
+option validation, upload integration, and CLI help/validation. Runtime source uses Web/Node APIs
+only and remains compatible with Node.js >= 20 and Bun.
 
 ### Authenticated URLs (e.g. Zoom recordings)
 
