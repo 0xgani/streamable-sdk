@@ -50,7 +50,8 @@
   },
   "sideEffects": false,
   "scripts": {
-    "test": "bun run build && node --test tests/*.test.mjs",
+    "test": "bun run build && bun run test:dist",
+    "test:dist": "node --import ./tests/network-guard.mjs --test tests/*.test.mjs",
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "dev": "bun src/cli.ts",

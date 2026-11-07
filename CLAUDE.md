@@ -20,4 +20,6 @@ Bun is the development tool: `bun install`, `bun run typecheck`, `bun run build`
   requests per part instead of piping the stream.
 - `Bun.write(path, response)` hangs on chunked responses; copy with a reader instead.
 - tsup's dts build needs TypeScript 5 (TS 6 breaks rollup-plugin-dts).
+- tsup 9 needs Node ^22.18, ^24.11 or >=26, so it can't build on Node 20. CI builds on 24 and runs
+  `bun run test:dist` against that build on each supported Node version.
 - `/uploads/shortcode` must be sent `version=unknown` or it returns 400.

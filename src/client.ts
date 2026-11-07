@@ -10,13 +10,32 @@
  *   5. POST https://api-f.streamable.com/api/v1/transcode/:sc
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { openAsBlob } from "node:fs";
 import { open, stat, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { multipartUpload, type RangeSource, type S3Credentials } from "./s3-multipart.js";
+import {
+  multipartUpload,
+  type RangeSource,
+  type S3Credentials,
+} from "./s3-multipart.js";
+import {
+  callUploadCallback,
+  UploadCallbackError,
+  validateMultipartOptions,
+} from "./checkpoint.js";
+import {
+  UploadResumeError,
+  validateUploadCheckpoint,
+  type DurableUploadOptions,
+  type UploadCheckpoint,
+  type UploadStage,
+  type UploadStageEvent,
+} from "./upload-state.js";
+
+export type UploadInput = string | URL | Blob | RangeSource;
 
 const AJAX_HOST = "https://ajax.streamable.com";
 const API_HOST = "https://api-f.streamable.com/api/v1";
@@ -61,6 +80,14 @@ export interface UploadOptions {
   partSize?: number;
   /** Parallel part uploads. Default 4. */
   concurrency?: number;
+  /** Opt-in durable multipart upload with application-owned persistence. */
+  resume?: DurableUploadOptions;
+  /** Awaited lifecycle barriers; throwing stops the operation, never triggers a fallback upload. */
+  onStage?: (event: UploadStageEvent) => void | Promise<void>;
+  /** Cancels source reads, upload requests, retry delays and processing waits. */
+  signal?: AbortSignal;
+  /** Per-part retries (default 5); durable retry across calls is controlled by the application. */
+  retries?: number;
 }
 
 export interface WaitForReadyOptions {
@@ -111,10 +138,11 @@ export interface ListVideosOptions {
 }
 
 /** What an upload reads from: a local file/Blob, or a remote file fetched range by range. */
-type OpenedSource = { name: string; size: number; cleanup?: () => Promise<void> } & (
-  | { file: Blob }
-  | { ranged: RangeSource }
-);
+type OpenedSource = {
+  name: string;
+  size: number;
+  cleanup?: () => Promise<void>;
+} & ({ file: Blob } | { ranged: RangeSource });
 
 interface ShortcodeResponse {
   shortcode: string;
@@ -143,8 +171,13 @@ export class StreamableError extends Error {
 /** The wait ended without confirmation; the remote video may still become ready. */
 export class ProcessingTimeoutError extends StreamableError {
   readonly url: string;
-  constructor(readonly shortcode: string, readonly lastStatus: number | null) {
-    super(`Timed out waiting for ${shortcode} to process; resume checking this video instead of uploading again`);
+  constructor(
+    readonly shortcode: string,
+    readonly lastStatus: number | null,
+  ) {
+    super(
+      `Timed out waiting for ${shortcode} to process; resume checking this video instead of uploading again`,
+    );
     this.name = "ProcessingTimeoutError";
     this.url = `https://streamable.com/${shortcode}`;
   }
@@ -153,7 +186,10 @@ export class ProcessingTimeoutError extends StreamableError {
 /** Streamable explicitly reported status 3. */
 export class ProcessingError extends StreamableError {
   readonly url: string;
-  constructor(readonly shortcode: string, message: string) {
+  constructor(
+    readonly shortcode: string,
+    message: string,
+  ) {
     super(`Processing failed: ${message}`);
     this.name = "ProcessingError";
     this.url = `https://streamable.com/${shortcode}`;
@@ -161,14 +197,28 @@ export class ProcessingError extends StreamableError {
 }
 
 function processingOptions(options: number | null | WaitForReadyOptions) {
-  const opts = typeof options === "object" && options !== null ? options : { timeoutMs: options };
+  const opts =
+    typeof options === "object" && options !== null
+      ? options
+      : { timeoutMs: options };
   const timeoutMs = opts.timeoutMs === undefined ? 15 * 60_000 : opts.timeoutMs;
   const pollIntervalMs = opts.pollIntervalMs ?? 3000;
-  if (timeoutMs !== null && (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 2_147_483_647)) {
-    throw new RangeError("timeoutMs must be null or a finite number between 0 and 2147483647");
+  if (
+    timeoutMs !== null &&
+    (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 2_147_483_647)
+  ) {
+    throw new RangeError(
+      "timeoutMs must be null or a finite number between 0 and 2147483647",
+    );
   }
-  if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0 || pollIntervalMs > 2_147_483_647) {
-    throw new RangeError("pollIntervalMs must be a finite number greater than 0 and at most 2147483647");
+  if (
+    !Number.isFinite(pollIntervalMs) ||
+    pollIntervalMs <= 0 ||
+    pollIntervalMs > 2_147_483_647
+  ) {
+    throw new RangeError(
+      "pollIntervalMs must be a finite number greater than 0 and at most 2147483647",
+    );
   }
   return { timeoutMs, pollIntervalMs, signal: opts.signal };
 }
@@ -183,13 +233,21 @@ export class StreamableClient {
     private password: string,
   ) {}
 
-  async login(): Promise<Record<string, any>> {
+  async login(
+    opts: { signal?: AbortSignal } = {},
+  ): Promise<Record<string, any>> {
     const res = await this.request(`${AJAX_HOST}/check`, {
       method: "POST",
       json: { username: this.email, password: this.password },
+      signal: opts.signal,
     });
     const body: any = await res.json();
-    if (body.error) throw new StreamableError(`Login failed: ${body.message}`, res.status, body);
+    if (body.error)
+      throw new StreamableError(
+        `Login failed: ${body.message}`,
+        res.status,
+        body,
+      );
     this.user = body;
     return body;
   }
@@ -202,36 +260,325 @@ export class StreamableClient {
    * to a temp file first. (Piping the response stream isn't used because Bun's HTTP clients
    * buffer the whole response regardless of how fast it is read.)
    */
-  async upload(source: string | URL | Blob, opts: UploadOptions = {}): Promise<UploadResult> {
+  async upload(
+    source: UploadInput | null,
+    opts: UploadOptions = {},
+  ): Promise<UploadResult> {
     // Reject invalid wait settings before creating a remote upload.
     if (opts.waitForReady) {
       processingOptions(opts.processing ?? {});
       opts.processing?.signal?.throwIfAborted();
     }
+    opts.signal?.throwIfAborted();
+    validateMultipartOptions(0, opts);
+    if (opts.resume && typeof opts.resume.save !== "function")
+      throw new UploadResumeError("invalid-checkpoint");
+    const saved = opts.resume?.checkpoint;
+    if (saved) {
+      validateUploadCheckpoint(saved);
+      if (
+        saved.account !== this.accountFingerprint() ||
+        (opts.title !== undefined && opts.title !== saved.title) ||
+        (opts.fileName !== undefined && opts.fileName !== saved.fileName) ||
+        (opts.labelId !== undefined && String(opts.labelId) !== saved.labelId)
+      )
+        throw new UploadResumeError("invalid-checkpoint");
+      if (["starting-processing", "uploaded"].includes(saved.phase))
+        return this.uploadDurably(undefined, opts);
+    }
+    if (source === null)
+      throw new TypeError(
+        "A re-readable source is required until upload is confirmed",
+      );
     const log = opts.onStatus ?? (() => {});
-    if (!this.user) await this.login();
+    if (!this.user) {
+      await this.stage("authenticating", opts);
+      await this.login({ signal: opts.signal });
+    }
+    await this.stage("opening-source", opts);
 
     let input: OpenedSource;
     if (source instanceof Blob) {
-      const name = opts.fileName ?? ("name" in source && typeof source.name === "string" ? source.name : "video.mp4");
+      const name =
+        opts.fileName ??
+        ("name" in source && typeof source.name === "string"
+          ? source.name
+          : "video.mp4");
       input = { file: source, name, size: source.size };
+    } else if (typeof source === "object" && !(source instanceof URL)) {
+      if (
+        !Number.isSafeInteger(source.size) ||
+        source.size < 0 ||
+        typeof source.read !== "function"
+      )
+        throw new TypeError("Invalid range source");
+      input = {
+        ranged: source,
+        size: source.size,
+        name: opts.fileName ?? "video.mp4",
+      };
     } else if (isUrl(source)) {
-      input = await this.openUrl(new URL(source), new Headers(opts.headers), log);
+      input = await this.openUrl(
+        new URL(source),
+        new Headers(opts.headers),
+        log,
+        opts.signal,
+      );
     } else {
       input = await this.openFile(String(source));
     }
     if (opts.fileName) input.name = opts.fileName;
 
     try {
+      if (opts.resume) return await this.uploadDurably(input, opts);
       return await this.uploadSource(input, opts, log);
     } finally {
       await input.cleanup?.();
     }
   }
 
-  async listVideos(opts: ListVideosOptions = {}): Promise<{ total: number; videos: Video[] }> {
+  private accountFingerprint() {
+    return createHash("sha256")
+      .update(this.email.trim().toLowerCase())
+      .digest("hex");
+  }
+
+  private async stage(
+    stage: UploadStage,
+    opts: UploadOptions,
+    shortcode?: string,
+    uploadConfirmed = false,
+  ) {
+    opts.signal?.throwIfAborted();
+    await callUploadCallback("stage", opts.onStage, {
+      stage,
+      resumed: !!opts.resume?.checkpoint,
+      uploadConfirmed,
+      ...(shortcode
+        ? { shortcode, url: `https://streamable.com/${shortcode}` }
+        : {}),
+    });
+    opts.signal?.throwIfAborted();
+  }
+
+  private async finishUpload(shortcode: string, opts: UploadOptions) {
+    await this.stage("uploaded", opts, shortcode, true);
+    if (opts.waitForReady) {
+      await this.stage("processing", opts, shortcode, true);
+      const processing = opts.processing ?? {};
+      const combined = combineSignals(opts.signal, processing.signal);
+      try {
+        await this.waitForReady(
+          shortcode,
+          opts.onStatus,
+          opts.signal
+            ? { ...processing, signal: combined.signal }
+            : opts.processing,
+        );
+      } finally {
+        combined.dispose();
+      }
+      await this.stage("ready", opts, shortcode, true);
+    }
+    return { shortcode, url: `https://streamable.com/${shortcode}` };
+  }
+
+  private async uploadDurably(
+    input: OpenedSource | undefined,
+    opts: UploadOptions,
+  ): Promise<UploadResult> {
+    const persistence = opts.resume!;
+    let state = persistence.checkpoint
+      ? structuredClone(persistence.checkpoint)
+      : undefined;
+    let writes = Promise.resolve();
+    const save = () => {
+      writes = writes.then(() =>
+        callUploadCallback(
+          "checkpoint",
+          persistence.save,
+          structuredClone(state!),
+        ),
+      );
+      return writes;
+    };
+    // An accepted upload can be recovered without the original file or download token.
+    if (state?.phase === "uploaded")
+      return this.finishUpload(state.shortcode, opts);
+    if (state?.phase === "starting-processing") {
+      const video = await this.getVideo(state.shortcode, {
+        signal: opts.signal,
+      });
+      if ([1, 2, 3].includes(video.status)) {
+        state.phase = "uploaded";
+        await save();
+        return this.finishUpload(state.shortcode, opts);
+      }
+      if (!persistence.retryProcessing)
+        throw new UploadResumeError("confirmation-pending", state.shortcode);
+      if (!this.user) {
+        await this.stage("authenticating", opts);
+        await this.login({ signal: opts.signal });
+      }
+    } else {
+      if (!input)
+        throw new TypeError(
+          "A re-readable source is required for multipart resume",
+        );
+      const source = "file" in input ? input.file : input.ranged;
+      await this.stage("fingerprinting", opts, state?.shortcode);
+      const fingerprint = createHash("sha256");
+      for (let start = 0; start < source.size; start += 8 * 1024 ** 2) {
+        opts.signal?.throwIfAborted();
+        const end = Math.min(start + 8 * 1024 ** 2, source.size);
+        const part =
+          source instanceof Blob
+            ? source.slice(start, end)
+            : await source.read(start, end, opts.signal);
+        if (part.size !== end - start)
+          throw new UploadResumeError("source-changed", state?.shortcode);
+        fingerprint.update(Buffer.from(await part.arrayBuffer()));
+      }
+      const hash = fingerprint.digest("hex");
+      if (
+        state &&
+        (state.size !== input.size || state.sourceFingerprint !== hash)
+      )
+        throw new UploadResumeError("source-changed", state.shortcode);
+      if (!state) {
+        const maxSize = this.user!.plan_max_size
+          ? this.user!.plan_max_size * GiB
+          : Infinity;
+        if (input.size > maxSize)
+          throw new StreamableError("File exceeds your Streamable plan limit");
+        await this.stage("creating-upload", opts);
+        const query = new URLSearchParams({
+          size: String(input.size),
+          version: CLIENT_VERSION,
+        });
+        if (opts.labelId) query.set("label_id", String(opts.labelId));
+        const meta = (await (
+          await this.request(`${API_HOST}/uploads/shortcode?${query}`, {
+            signal: opts.signal,
+          })
+        ).json()) as ShortcodeResponse;
+        state = {
+          version: 1,
+          account: this.accountFingerprint(),
+          shortcode: meta.shortcode,
+          fileName: input.name,
+          title: opts.title ?? input.name.replace(/\.[^.]+$/, ""),
+          labelId: opts.labelId ? String(opts.labelId) : "",
+          size: input.size,
+          sourceFingerprint: hash,
+          phase: "created",
+          storage: {
+            bucket: meta.bucket,
+            key: meta.key,
+            accelerated: !!meta.accelerated,
+            credentials: meta.credentials,
+            clockOffsetMs: meta.time ? meta.time * 1000 - Date.now() : 0,
+          },
+          transcoderOptions: meta.transcoder_options,
+        };
+        validateUploadCheckpoint(state);
+        await save();
+        opts.onStatus?.(`Got shortcode ${state.shortcode}`);
+      }
+      if (state.phase === "created") {
+        await this.stage("initializing", opts, state.shortcode);
+        await this.request(`${API_HOST}/videos/${state.shortcode}/initialize`, {
+          method: "POST",
+          json: {
+            original_size: state.size,
+            original_name: state.fileName,
+            upload_source: "web",
+            title: state.title,
+          },
+          signal: opts.signal,
+        });
+        state.phase = "initialized";
+        await save();
+      }
+      if (state.phase !== "storage-complete") {
+        await this.stage("uploading", opts, state.shortcode);
+        state.phase = "uploading";
+        await save();
+        const uploadState = state;
+        await multipartUpload(source, {
+          ...state.storage,
+          partSize: opts.partSize,
+          concurrency: opts.concurrency,
+          retries: opts.retries,
+          signal: opts.signal,
+          resume: state.multipart,
+          sourceIdentity: hash,
+          onProgress: opts.onProgress
+            ? (loaded, total) => {
+                try {
+                  opts.onProgress!(loaded, total);
+                } catch (error) {
+                  throw new UploadCallbackError("progress", error);
+                }
+              }
+            : undefined,
+          refreshCredentials: persistence.refreshCredentials
+            ? async () => {
+                uploadState.storage.credentials =
+                  await persistence.refreshCredentials!(
+                    structuredClone(uploadState),
+                  );
+                await save();
+                return uploadState.storage.credentials;
+              }
+            : undefined,
+          verifyCompleted: persistence.verifyCompleted
+            ? () => persistence.verifyCompleted!(structuredClone(uploadState))
+            : undefined,
+          onCheckpoint: async (multipart) => {
+            const previous = uploadState.multipart?.phase;
+            uploadState.multipart = multipart;
+            if (multipart.phase === "completed")
+              uploadState.phase = "storage-complete";
+            await save();
+            if (multipart.phase === "completing" && previous !== "completing")
+              await this.stage(
+                "completing-upload",
+                opts,
+                uploadState.shortcode,
+              );
+          },
+        });
+      }
+      await this.stage("storage-complete", opts, state.shortcode);
+    }
+    if (!state) throw new UploadResumeError("invalid-checkpoint");
+    await this.stage("starting-processing", opts, state.shortcode);
+    state.phase = "starting-processing";
+    await save();
+    opts.onStatus?.("Starting transcode");
+    await this.request(`${API_HOST}/transcode/${state.shortcode}`, {
+      method: "POST",
+      json: {
+        ...state.transcoderOptions,
+        upload_source: "web",
+        title: state.title,
+      },
+      signal: opts.signal,
+    });
+    state.phase = "uploaded";
+    await save();
+    return this.finishUpload(state.shortcode, opts);
+  }
+
+  async listVideos(
+    opts: ListVideosOptions = {},
+  ): Promise<{ total: number; videos: Video[] }> {
     if (!this.user) await this.login();
-    const query = new URLSearchParams({ count: String(opts.count ?? 50), page: String(opts.page ?? 1) });
+    const query = new URLSearchParams({
+      count: String(opts.count ?? 50),
+      page: String(opts.page ?? 1),
+    });
     if (opts.labelId) query.set("labels", String(opts.labelId));
     if (opts.search) query.set("search", opts.search);
     const res = await this.request(`${API_HOST}/videos?${query}`);
@@ -241,14 +588,28 @@ export class StreamableClient {
   /** Permanently deletes a video from the account. */
   async deleteVideo(shortcode: string): Promise<void> {
     if (!this.user) await this.login();
-    const res = await this.request(`${API_HOST}/videos/${encodeURIComponent(shortcode)}`, { method: "DELETE" });
-    if ((await res.text()).trim() !== "true") throw new StreamableError(`Failed to delete ${shortcode}`);
+    const res = await this.request(
+      `${API_HOST}/videos/${encodeURIComponent(shortcode)}`,
+      { method: "DELETE" },
+    );
+    if ((await res.text()).trim() !== "true")
+      throw new StreamableError(`Failed to delete ${shortcode}`);
   }
 
   /** Public video info. */
-  async getVideo(shortcode: string, opts: { signal?: AbortSignal } = {}): Promise<Record<string, any>> {
-    const res = await fetch(`${PUBLIC_API_HOST}/videos/${encodeURIComponent(shortcode)}`, { signal: opts.signal });
-    if (!res.ok) throw new StreamableError(`Video lookup failed (${res.status})`, res.status);
+  async getVideo(
+    shortcode: string,
+    opts: { signal?: AbortSignal } = {},
+  ): Promise<Record<string, any>> {
+    const res = await fetch(
+      `${PUBLIC_API_HOST}/videos/${encodeURIComponent(shortcode)}`,
+      { signal: opts.signal },
+    );
+    if (!res.ok)
+      throw new StreamableError(
+        `Video lookup failed (${res.status})`,
+        res.status,
+      );
     return (await res.json()) as Record<string, any>;
   }
 
@@ -257,26 +618,40 @@ export class StreamableClient {
    * `<shortcode>.mp4` in the current directory). Accepts a shortcode or a streamable.com URL.
    * Works for any public video, so it doesn't log in.
    */
-  async download(video: string, dest?: string, opts: DownloadOptions = {}): Promise<DownloadResult> {
+  async download(
+    video: string,
+    dest?: string,
+    opts: DownloadOptions = {},
+  ): Promise<DownloadResult> {
     const shortcode = parseShortcode(video);
     const format = opts.format ?? "mp4";
     const info = await this.getVideo(shortcode);
-    if (info.status !== 2) throw new StreamableError(`${shortcode} isn't ready yet (status ${info.status})`);
+    if (info.status !== 2)
+      throw new StreamableError(
+        `${shortcode} isn't ready yet (status ${info.status})`,
+      );
     const file = info.files?.[format];
     if (!file?.url) {
       const files: Record<string, { url?: string }> = info.files ?? {};
-      const available = Object.keys(files).filter((k) => files[k]?.url).join(", ") || "none";
-      throw new StreamableError(`${shortcode} has no "${format}" file (available: ${available})`);
+      const available =
+        Object.keys(files)
+          .filter((k) => files[k]?.url)
+          .join(", ") || "none";
+      throw new StreamableError(
+        `${shortcode} has no "${format}" file (available: ${available})`,
+      );
     }
 
     let path = dest ?? `${shortcode}.mp4`;
-    if (dest && (await stat(dest).catch(() => null))?.isDirectory()) path = join(dest, `${shortcode}.mp4`);
+    if (dest && (await stat(dest).catch(() => null))?.isDirectory())
+      path = join(dest, `${shortcode}.mp4`);
 
     // File URLs come protocol-relative ("//cdn...") or mangled ("https:https://cdn..."), so keep
     // everything from the first "//".
     const fileUrl = String(file.url);
     const res = await fetch(`https:${fileUrl.slice(fileUrl.indexOf("//"))}`);
-    if (!res.ok || !res.body) throw new StreamableError(`Download failed (${res.status})`, res.status);
+    if (!res.ok || !res.body)
+      throw new StreamableError(`Download failed (${res.status})`, res.status);
     const total = Number(res.headers.get("content-length")) || 0;
 
     // Manual copy: Bun.write(path, response) hangs on chunked responses.
@@ -300,29 +675,47 @@ export class StreamableClient {
     return { path, size: loaded };
   }
 
-  async waitForReady(shortcode: string, log: (m: string) => void = () => {}, options: number | null | WaitForReadyOptions = {}) {
+  async waitForReady(
+    shortcode: string,
+    log: (m: string) => void = () => {},
+    options: number | null | WaitForReadyOptions = {},
+  ) {
     const { timeoutMs, pollIntervalMs, signal } = processingOptions(options);
     signal?.throwIfAborted();
     let lastStatus: number | null = null;
-    if (timeoutMs === 0) throw new ProcessingTimeoutError(shortcode, lastStatus);
+    if (timeoutMs === 0)
+      throw new ProcessingTimeoutError(shortcode, lastStatus);
     const controller = new AbortController();
     const cancel = () => controller.abort(signal!.reason);
     signal?.addEventListener("abort", cancel, { once: true });
-    const timer = timeoutMs === null ? undefined : setTimeout(() => {
-      controller.abort(new ProcessingTimeoutError(shortcode, lastStatus));
-    }, timeoutMs);
+    const timer =
+      timeoutMs === null
+        ? undefined
+        : setTimeout(() => {
+            controller.abort(new ProcessingTimeoutError(shortcode, lastStatus));
+          }, timeoutMs);
     try {
       for (;;) {
         controller.signal.throwIfAborted();
-        const video = await this.getVideo(shortcode, { signal: controller.signal }).catch(() => {
+        const video = await this.getVideo(shortcode, {
+          signal: controller.signal,
+        }).catch(() => {
           controller.signal.throwIfAborted();
           return null;
         });
         controller.signal.throwIfAborted();
         if (typeof video?.status === "number") lastStatus = video.status;
         if (video?.status === 2) return video;
-        if (video?.status === 3) throw new ProcessingError(shortcode, String(video.message ?? "unknown"));
-        log(video ? `Processing… ${video.percent ?? 0}%` : "Processing status unavailable; retrying");
+        if (video?.status === 3)
+          throw new ProcessingError(
+            shortcode,
+            String(video.message ?? "unknown"),
+          );
+        log(
+          video
+            ? `Processing… ${video.percent ?? 0}%`
+            : "Processing status unavailable; retrying",
+        );
         await sleep(pollIntervalMs, undefined, { signal: controller.signal });
       }
     } catch (error) {
@@ -336,35 +729,64 @@ export class StreamableClient {
 
   private async openFile(filePath: string): Promise<OpenedSource> {
     const info = await stat(filePath).catch(() => null);
-    if (!info?.isFile()) throw new StreamableError(`File not found: ${filePath}`);
+    if (!info?.isFile())
+      throw new StreamableError(`File not found: ${filePath}`);
     // openAsBlob reads lazily, so slicing it for multipart parts never loads the whole file.
     const file = await openAsBlob(filePath);
     return { file, name: basename(filePath), size: file.size };
   }
 
-  private async openUrl(url: URL, headers: Headers, log: (m: string) => void): Promise<OpenedSource> {
+  private async openUrl(
+    url: URL,
+    headers: Headers,
+    log: (m: string) => void,
+    signal?: AbortSignal,
+  ): Promise<OpenedSource> {
     // Probe with a 1-byte range: a 206 with a total size means parts can be fetched on demand.
-    const res = await fetchSource(url, headers, { range: "bytes=0-0" });
-    if (!res.ok || !res.body) throw new StreamableError(`Download failed (${res.status}): ${url}`, res.status);
+    const res = await fetchSource(url, headers, { range: "bytes=0-0" }, signal);
+    if (!res.ok || !res.body)
+      throw new StreamableError(
+        `Download failed (${res.status}): ${url}`,
+        res.status,
+      );
 
     const name = fileNameFromResponse(res, url);
-    const total = Number(res.headers.get("content-range")?.match(/\/(\d+)$/)?.[1]);
+    const total = Number(
+      res.headers.get("content-range")?.match(/\/(\d+)$/)?.[1],
+    );
     if (res.status === 206 && Number.isFinite(total)) {
       await res.body.cancel();
       // Pin the exact version so a change mid-upload is caught. Each part re-requests the
       // original URL, so short-lived signed redirect targets can't expire mid-upload.
       const etag = res.headers.get("etag");
-      const validator = (etag && !etag.startsWith("W/") ? etag : null) ?? res.headers.get("last-modified");
-      log(`Streaming ${url} via range requests (${(total / 1024 / 1024).toFixed(1)} MB)`);
+      const validator =
+        (etag && !etag.startsWith("W/") ? etag : null) ??
+        res.headers.get("last-modified");
+      log(
+        `Streaming ${url} via range requests (${(total / 1024 / 1024).toFixed(1)} MB)`,
+      );
       return {
         name,
         size: total,
-        ranged: { size: total, read: (start, end) => readRange(url, headers, start, end, validator) },
+        ranged: {
+          size: total,
+          read: (start, end, partSignal) =>
+            readRange(
+              url,
+              headers,
+              start,
+              end,
+              validator,
+              partSignal ?? signal,
+            ),
+        },
       };
     }
 
     // 200: the server ignored Range, so this response is the whole file.
-    log(`${url} doesn't support range requests, downloading to a temp file first`);
+    log(
+      `${url} doesn't support range requests, downloading to a temp file first`,
+    );
     const tmpPath = join(tmpdir(), `streamable-${randomUUID()}-${name}`);
     const cleanup = () => unlink(tmpPath).catch(() => {});
     try {
@@ -388,26 +810,47 @@ export class StreamableClient {
     return { file, name, size: file.size, cleanup };
   }
 
-  private async uploadSource(input: OpenedSource, opts: UploadOptions, log: (m: string) => void) {
+  private async uploadSource(
+    input: OpenedSource,
+    opts: UploadOptions,
+    log: (m: string) => void,
+  ) {
     const { name: fileName, size } = input;
     const title = opts.title ?? fileName.replace(/\.[^.]+$/, "");
 
-    const maxSize = this.user!.plan_max_size ? this.user!.plan_max_size * GiB : Infinity;
+    const maxSize = this.user!.plan_max_size
+      ? this.user!.plan_max_size * GiB
+      : Infinity;
     if (size > maxSize) {
       throw new StreamableError(
         `File is ${(size / GiB).toFixed(2)} GB but the ${this.user!.plan_name} plan allows ${this.user!.plan_max_size} GB`,
       );
     }
 
-    const query = new URLSearchParams({ size: String(size), version: CLIENT_VERSION });
+    const query = new URLSearchParams({
+      size: String(size),
+      version: CLIENT_VERSION,
+    });
     if (opts.labelId) query.set("label_id", String(opts.labelId));
-    const meta = (await (await this.request(`${API_HOST}/uploads/shortcode?${query}`)).json()) as ShortcodeResponse;
+    await this.stage("creating-upload", opts);
+    const meta = (await (
+      await this.request(`${API_HOST}/uploads/shortcode?${query}`, {
+        signal: opts.signal,
+      })
+    ).json()) as ShortcodeResponse;
     const { shortcode } = meta;
     log(`Got shortcode ${shortcode}`);
 
+    await this.stage("initializing", opts, shortcode);
     await this.request(`${API_HOST}/videos/${shortcode}/initialize`, {
       method: "POST",
-      json: { original_size: size, original_name: fileName, upload_source: "web", title },
+      json: {
+        original_size: size,
+        original_name: fileName,
+        upload_source: "web",
+        title,
+      },
+      signal: opts.signal,
     });
 
     const multipartOpts = {
@@ -418,9 +861,24 @@ export class StreamableClient {
       serverTime: meta.time,
       partSize: opts.partSize,
       concurrency: opts.concurrency,
-      onProgress: opts.onProgress,
+      onProgress: opts.onProgress
+        ? (loaded: number, total: number) => {
+            try {
+              opts.onProgress!(loaded, total);
+            } catch (error) {
+              throw new UploadCallbackError("progress", error);
+            }
+          }
+        : undefined,
+      signal: opts.signal,
+      retries: opts.retries,
+      onStage: async (stage: "uploading" | "completing" | "completed") => {
+        if (stage === "completing")
+          await this.stage("completing-upload", opts, shortcode);
+      },
     };
     const sizeMb = (size / 1024 / 1024).toFixed(1);
+    await this.stage("uploading", opts, shortcode);
     if ("ranged" in input) {
       log(`Uploading ${fileName} (${sizeMb} MB) to S3 via multipart`);
       await multipartUpload(input.ranged, multipartOpts);
@@ -430,24 +888,44 @@ export class StreamableClient {
       try {
         await multipartUpload(file, multipartOpts);
       } catch (err) {
-        if (file.size > MAX_FORM_POST_SIZE) throw err;
-        log(`Multipart upload failed (${(err as Error).message}), retrying as a single POST`);
-        await this.formPostUpload(file, fileName, meta, opts.onProgress);
+        if (
+          file.size > MAX_FORM_POST_SIZE ||
+          opts.signal?.aborted ||
+          err instanceof UploadCallbackError
+        )
+          throw err;
+        log(
+          `Multipart upload failed (${(err as Error).message}), retrying as a single POST`,
+        );
+        await this.formPostUpload(
+          file,
+          fileName,
+          meta,
+          opts.onProgress,
+          opts.signal,
+        );
       }
     } else {
       log(`Uploading ${fileName} (${sizeMb} MB) to S3`);
-      await this.formPostUpload(input.file, fileName, meta, opts.onProgress);
+      await this.formPostUpload(
+        input.file,
+        fileName,
+        meta,
+        opts.onProgress,
+        opts.signal,
+      );
     }
 
+    await this.stage("storage-complete", opts, shortcode);
+    await this.stage("starting-processing", opts, shortcode);
     log("Starting transcode");
     await this.request(`${API_HOST}/transcode/${shortcode}`, {
       method: "POST",
       json: { upload_source: "web", title, ...meta.transcoder_options },
+      signal: opts.signal,
     });
 
-    const result = { shortcode, url: `https://streamable.com/${shortcode}` };
-    if (opts.waitForReady) await this.waitForReady(shortcode, log, opts.processing);
-    return result;
+    return this.finishUpload(shortcode, opts);
   }
 
   private async formPostUpload(
@@ -455,25 +933,38 @@ export class StreamableClient {
     fileName: string,
     meta: ShortcodeResponse,
     onProgress?: (loaded: number, total: number) => void,
+    signal?: AbortSignal,
   ) {
     const form = new FormData();
     for (const [k, v] of Object.entries(meta.fields)) form.append(k, v);
     form.append("file", file, fileName);
     // S3 must not receive the Streamable cookies, so use plain fetch here.
-    const s3 = await fetch(meta.url, { method: "POST", body: form });
-    if (!s3.ok) throw new StreamableError(`S3 upload failed (${s3.status})`, s3.status, await s3.text());
+    const s3 = await fetch(meta.url, { method: "POST", body: form, signal });
+    if (!s3.ok)
+      throw new StreamableError(
+        `S3 upload failed (${s3.status})`,
+        s3.status,
+        await s3.text(),
+      );
     onProgress?.(file.size, file.size);
   }
 
-  private async request(url: string, init: { method?: string; json?: unknown } = {}): Promise<Response> {
+  private async request(
+    url: string,
+    init: { method?: string; json?: unknown; signal?: AbortSignal } = {},
+  ): Promise<Response> {
     const headers: Record<string, string> = { ...DEFAULT_HEADERS };
-    if (this.cookies.size) headers.cookie = [...this.cookies].map(([k, v]) => `${k}=${v}`).join("; ");
+    if (this.cookies.size)
+      headers.cookie = [...this.cookies]
+        .map(([k, v]) => `${k}=${v}`)
+        .join("; ");
     if (init.json !== undefined) headers["content-type"] = "application/json";
 
     const res = await fetch(url, {
       method: init.method ?? "GET",
       headers,
       body: init.json !== undefined ? JSON.stringify(init.json) : undefined,
+      signal: init.signal,
     });
     for (const c of res.headers.getSetCookie()) {
       const [pair = ""] = c.split(";");
@@ -482,7 +973,11 @@ export class StreamableClient {
     }
     if (!res.ok) {
       const body = await res.text();
-      throw new StreamableError(`${init.method ?? "GET"} ${url} failed (${res.status}): ${body}`, res.status, body);
+      throw new StreamableError(
+        `${init.method ?? "GET"} ${url} failed (${res.status}): ${body}`,
+        res.status,
+        body,
+      );
     }
     return res;
   }
@@ -504,14 +999,21 @@ function isUrl(source: string | URL): boolean {
  * GET a URL source, following redirects manually so the caller's headers (e.g. an auth token)
  * only go to the original origin. Signed CDN/S3 redirect targets would reject or leak them.
  */
-async function fetchSource(url: URL, extra: Headers, base: Record<string, string>): Promise<Response> {
+async function fetchSource(
+  url: URL,
+  extra: Headers,
+  base: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<Response> {
   let current = url;
   for (let hops = 0; hops <= 10; hops++) {
-    const headers = new Headers(current.origin === url.origin ? extra : undefined);
+    const headers = new Headers(
+      current.origin === url.origin ? extra : undefined,
+    );
     // Ask for the raw bytes so Content-Length / Content-Range match what we read.
     headers.set("accept-encoding", "identity");
     for (const [k, v] of Object.entries(base)) headers.set(k, v);
-    const res = await fetch(current, { headers, redirect: "manual" });
+    const res = await fetch(current, { headers, redirect: "manual", signal });
     const location = res.headers.get("location");
     if (res.status < 300 || res.status >= 400 || !location) return res;
     await res.body?.cancel();
@@ -526,10 +1028,11 @@ async function readRange(
   start: number,
   end: number,
   validator: string | null,
+  signal?: AbortSignal,
 ): Promise<Blob> {
   const base: Record<string, string> = { range: `bytes=${start}-${end - 1}` };
   if (validator) base["if-range"] = validator;
-  const res = await fetchSource(url, extra, base);
+  const res = await fetchSource(url, extra, base, signal);
   if (res.status !== 206) {
     await res.body?.cancel();
     throw new StreamableError(
@@ -540,13 +1043,39 @@ async function readRange(
     );
   }
   const blob = await res.blob();
-  if (blob.size !== end - start) throw new StreamableError(`Range ${start}-${end - 1} returned ${blob.size} bytes`);
+  if (blob.size !== end - start)
+    throw new StreamableError(
+      `Range ${start}-${end - 1} returned ${blob.size} bytes`,
+    );
   return blob;
+}
+
+function combineSignals(first?: AbortSignal, second?: AbortSignal) {
+  if (!first || !second || first === second)
+    return { signal: first ?? second, dispose: () => {} };
+  const controller = new AbortController();
+  const cancelFirst = () => controller.abort(first.reason),
+    cancelSecond = () => controller.abort(second.reason);
+  if (first.aborted) cancelFirst();
+  else if (second.aborted) cancelSecond();
+  else {
+    first.addEventListener("abort", cancelFirst, { once: true });
+    second.addEventListener("abort", cancelSecond, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      first.removeEventListener("abort", cancelFirst);
+      second.removeEventListener("abort", cancelSecond);
+    },
+  };
 }
 
 function fileNameFromResponse(res: Response, url: URL): string {
   const disposition = res.headers.get("content-disposition") ?? "";
-  const match = disposition.match(/filename\*=UTF-8''([^;]+)/i) ?? disposition.match(/filename="?([^";]+)"?/i);
+  const match =
+    disposition.match(/filename\*=UTF-8''([^;]+)/i) ??
+    disposition.match(/filename="?([^";]+)"?/i);
   const raw = match?.[1] ?? url.pathname.split("/").pop() ?? "";
   let name = raw;
   try {
